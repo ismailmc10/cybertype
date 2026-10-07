@@ -40,6 +40,18 @@ export async function POST(req: NextRequest) {
     });
     if (error)
       return NextResponse.json({ error: error.message }, { status: 400 });
+    // Fail closed if the frontend is deployed before the required migration.
+    if (
+      typeof data?.event?.leaderboard_visible !== "boolean" ||
+      typeof data?.event?.results_finalized !== "boolean"
+    )
+      return NextResponse.json(
+        {
+          error:
+            "Results security migration is required. Ask the coordinator to apply 002_results_review.sql.",
+        },
+        { status: 503 },
+      );
     return NextResponse.json(data, {
       headers: { "Cache-Control": "no-store" },
     });

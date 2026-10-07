@@ -41,6 +41,12 @@ import {
 } from "@/lib/game";
 import { configured, supabase } from "@/lib/supabase";
 import { demoApi } from "@/lib/demo";
+import Scorecards from "./Scorecards";
+import ResultsReview, {
+  LockedLeaderboard,
+  ReviewDetails,
+} from "./ResultsReview";
+import { resultsCSV } from "@/lib/results-csv";
 
 type Tab = "overview" | "arena" | "leaderboard" | "rules" | "admin";
 type Batch = { round: number; seq: number; chars: string[] };
@@ -55,7 +61,11 @@ export default function CyberType() {
     [demoAdmin, setDemoAdmin] = useState(false),
     [projector, setProjector] = useState(false),
     [online, setOnline] = useState(true),
-    [queueVersion, setQueueVersion] = useState(0),
+    [inputBuffer, setInputBuffer] = useState<{
+      batch: Batch | null;
+      pending: string[];
+    }>({ batch: null, pending: [] }),
+    [observedAt, setObservedAt] = useState(0),
     [alias, setAlias] = useState(""),
     [search, setSearch] = useState(""),
     [selected, setSelected] = useState<Run | null>(null),
@@ -69,9 +79,18 @@ export default function CyberType() {
     retryAfter = useRef(0),
     typing = useRef<HTMLTextAreaElement>(null),
     authUser = useRef<string | null>(null),
-    adminRef = useRef(false);
-  adminRef.current = demoAdmin;
+    adminRef = useRef(false),
+    sessionEpoch = useRef(0);
+  useEffect(() => {
+    adminRef.current = demoAdmin;
+  }, [demoAdmin]);
   const persist = () => {
+    setInputBuffer({
+      batch: batch.current
+        ? { ...batch.current, chars: [...batch.current.chars] }
+        : null,
+      pending: [...pending.current],
+    });
     if (authUser.current)
       sessionStorage.setItem(
         "cybertype-pending-" + authUser.current,
@@ -79,17 +98,26 @@ export default function CyberType() {
       );
   };
   const accept = (s: Snapshot) => {
+    // An older in-flight snapshot must not undo hide/reopen/reset in the UI.
+    if (
+      current.current &&
+      s.event.results_version < current.current.event.results_version
+    )
+      return;
     current.current = s;
     setSnap(s);
+    setObservedAt(Date.now());
     lastSync.current = Date.now();
   };
   const call = useCallback(
     async (action: string, payload: Record<string, unknown> = {}) => {
       if (!configured) return demoApi(action, payload, adminRef.current);
+      const epoch = sessionEpoch.current;
       const {
         data: { session },
       } = await supabase!.auth.getSession();
       const res = await fetch("/api/event", {
+        signal: AbortSignal.timeout(8000),
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -100,6 +128,8 @@ export default function CyberType() {
         body: JSON.stringify({ action, payload }),
       });
       const data = await res.json();
+      if (epoch !== sessionEpoch.current)
+        throw Error("Session changed. Please retry.");
       if (!res.ok) throw Error(data.error || "Connection failed");
       return data as Snapshot;
     },
@@ -118,21 +148,42 @@ export default function CyberType() {
     load();
     const sub = supabase?.auth.onAuthStateChange((_event, session) => {
       const id = session?.user.id || null;
-      authUser.current = id;
       setUser(session?.user.email || null);
-      pending.current = [];
-      batch.current = null;
-      if (id) {
-        try {
-          const saved = JSON.parse(
-            sessionStorage.getItem("cybertype-pending-" + id) || "null",
-          );
-          if (saved) {
-            pending.current = saved.pending || [];
-            batch.current = saved.batch;
+      if (id !== authUser.current) {
+        sessionEpoch.current++;
+        authUser.current = id;
+        pending.current = [];
+        batch.current = null;
+        setSelected(null);
+        setEdit(null);
+        // Erase private data immediately on identity changes, not after a poll.
+        if (current.current)
+          accept({
+            ...current.current,
+            admin: false,
+            run: null,
+            personal_score: null,
+            leaderboard: [],
+            standings: [],
+            participants: null,
+            adjustments: null,
+            audit: null,
+          });
+        if (id) {
+          try {
+            const saved = JSON.parse(
+              sessionStorage.getItem("cybertype-pending-" + id) || "null",
+            );
+            if (saved) {
+              pending.current = saved.pending || [];
+              batch.current = saved.batch;
+            }
+          } catch {
+            /* Invalid saved input is safely discarded. */
           }
-        } catch {}
+        }
       }
+      persist();
       setTimeout(load, 0);
     });
     const channel = supabase
@@ -200,7 +251,6 @@ export default function CyberType() {
         }
         accept(next);
         setOnline(true);
-        setQueueVersion((v) => v + 1);
       } catch {
         setOnline(false);
         lastSync.current = Date.now();
@@ -215,14 +265,15 @@ export default function CyberType() {
     if (tab === "arena" && snap?.run?.status === "active")
       typing.current?.focus();
   }, [tab, snap?.run?.status, snap?.run?.round]);
+  const modalOpen = auth || !!selected || !!edit;
   useEffect(() => {
-    if (!auth && !selected && !edit) return;
+    if (!modalOpen) return;
     const before = document.activeElement as HTMLElement;
     const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
     const focusables = () =>
       Array.from(
         dialog?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled),input,textarea,[tabindex="0"]',
+          'button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),[tabindex="0"]',
         ) || [],
       );
     focusables()[0]?.focus();
@@ -250,7 +301,7 @@ export default function CyberType() {
       document.removeEventListener("keydown", handler);
       before?.focus();
     };
-  }, [auth, !!selected, !!edit]);
+  }, [modalOpen]);
   async function act(action: string, payload: Record<string, unknown> = {}) {
     if (busy.current) {
       setNotice("Syncing your last action. Try again in a moment.");
@@ -270,17 +321,35 @@ export default function CyberType() {
       setWorking(false);
     }
   }
-  async function command(command: string, extra: Record<string, unknown> = {}) {
-    if (
-      ["end", "reset"].includes(command) &&
-      !window.confirm(
-        command === "reset"
-          ? "Reset this event? All participant attempts and results will be removed. Export results first."
-          : "End this event now? Active attempts will stop and registration will close.",
-      )
-    )
-      return;
-    return await act("admin", { command, ...extra, confirm: "CONFIRM" });
+  async function command(name: string, extra: Record<string, unknown> = {}) {
+    const confirmations: Record<string, string> = {
+      end: "End this event now? Active attempts will stop. The leaderboard will stay locked for coordinator review.",
+      reset:
+        "Reset this event? All participant attempts, standings, and score adjustments will be removed. Audit history is retained. Export results first.",
+      finalize:
+        "Finalize these results? Further adjustments will be locked until you explicitly reopen results. The leaderboard stays hidden.",
+      reopen:
+        "Reopen results? The audience leaderboard will be hidden immediately and adjustments will be enabled again.",
+      reveal:
+        "Reveal the approved final leaderboard to all participants and the audience? Confirm you have reviewed the final scores.",
+      hide: "Hide the leaderboard from participants and the audience?",
+      adjust: `Apply ${Number(extra.delta) > 0 ? "+" : ""}${extra.delta} points to ${extra.alias}?\n\nReason: ${extra.reason}`,
+    };
+    if (confirmations[name] && !window.confirm(confirmations[name]))
+      return false;
+    const ok = await act("admin", {
+      command: name,
+      ...extra,
+      confirm: "CONFIRM",
+      results_version: snap?.event.results_version,
+    });
+    if (ok && name === "reset") {
+      pending.current = [];
+      batch.current = null;
+      persist();
+      setSelected(null);
+    }
+    return ok;
   }
   const s = snap?.event.settings || defaults;
   const raw = snap?.run;
@@ -288,15 +357,21 @@ export default function CyberType() {
   if (raw && snap?.event.status === "running" && raw.status === "active") {
     const c = raw.cards[raw.round - 1],
       queued = [
-        ...(batch.current?.round === raw.round ? batch.current.chars : []),
-        ...pending.current,
+        ...(inputBuffer.batch?.round === raw.round
+          ? inputBuffer.batch.chars
+          : []),
+        ...inputBuffer.pending,
       ];
     if (queued.length) run = advance(raw, snap.event, queued, c.seq + 1);
   }
-  void queueVersion;
   const card = run?.cards[(raw?.round || 1) - 1],
-    board = snap?.leaderboard || [],
-    rank = raw ? board.findIndex((x) => x.id === raw.id) + 1 : 0;
+    publicVisible =
+      online &&
+      snap?.event.leaderboard_visible === true &&
+      snap?.event.results_finalized === true &&
+      snap?.event.status === "ended",
+    board = publicVisible ? snap?.leaderboard || [] : [],
+    privateStandings = snap?.admin ? snap.standings || [] : [];
   const total = raw ? entry(raw).score : 0;
   function onChar(ch: string) {
     if (
@@ -313,56 +388,10 @@ export default function CyberType() {
     }
     pending.current.push(ch);
     persist();
-    setQueueVersion((v) => v + 1);
   }
   function exportCSV() {
-    const rows = [
-      [
-        "Rank",
-        "Public alias",
-        "Participant ID",
-        "Round",
-        "Status",
-        "Score",
-        "WPM",
-        "Accuracy",
-        "R1 score",
-        "R2 score",
-        "R3 score",
-        "R3 penalties",
-        "R3 errors",
-      ],
-      ...board.map((p, i) => {
-        const r = snap?.participants?.find((r) => r.id === p.id);
-        return [
-          i + 1,
-          p.alias,
-          p.id,
-          p.round,
-          p.status,
-          p.score,
-          p.wpm,
-          p.accuracy,
-          ...[0, 1, 2].map((n) => r?.cards[n]?.score ?? ""),
-          r?.cards[2]?.penalty ?? "",
-          r?.cards[2]?.errors ?? "",
-        ];
-      }),
-    ];
-    const csv = rows
-      .map((row) =>
-        row
-          .map(
-            (v) =>
-              '"' +
-              String(v)
-                .replace(/^[=+@\-\t\r]/, "'$&")
-                .replaceAll('"', '""') +
-              '"',
-          )
-          .join(","),
-      )
-      .join("\r\n");
+    if (!snap?.admin) return;
+    const csv = resultsCSV(snap);
     const url = URL.createObjectURL(
       new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" }),
     );
@@ -445,6 +474,7 @@ export default function CyberType() {
                 className={tab === "admin" ? "nav active" : "nav"}
                 onClick={() => {
                   if (!configured) {
+                    adminRef.current = true;
                     setDemoAdmin(true);
                     accept(demoApi("snapshot", {}, true));
                   }
@@ -692,7 +722,7 @@ export default function CyberType() {
                 <div className="mini-board">
                   <div className="panel-title">
                     <h3>
-                      <Activity size={18} /> On the leaderboard
+                      <Activity size={18} /> Official results
                     </h3>
                     <button
                       className="text-button"
@@ -701,22 +731,17 @@ export default function CyberType() {
                       View all <ArrowUpRight size={14} />
                     </button>
                   </div>
-                  {board.slice(0, 3).map((p, i) => (
-                    <div className="mini-row" key={p.id}>
-                      <span className={"place p" + i}>0{i + 1}</span>
-                      <span className="avatar">
-                        {p.alias.slice(0, 2).toUpperCase()}
-                      </span>
-                      <strong>{p.alias}</strong>
-                      <span className="mono">
-                        {p.score.toLocaleString()} <small>pts</small>
-                      </span>
+                  {publicVisible ? (
+                    <div className="empty">
+                      <Shield size={28} />
+                      <h3>Official results released</h3>
+                      <p>The coordinator has approved the final standings.</p>
+                      <button onClick={() => setTab("leaderboard")}>
+                        View final leaderboard <ArrowUpRight size={14} />
+                      </button>
                     </div>
-                  ))}
-                  {!board.length && (
-                    <p className="muted">
-                      The arena is waiting for its first competitor.
-                    </p>
+                  ) : (
+                    <LockedLeaderboard compact />
                   )}
                 </div>
               </section>
@@ -811,7 +836,11 @@ export default function CyberType() {
                       <p>Contact an event coordinator.</p>
                     </div>
                   ) : ["complete", "ended"].includes(raw.status) ? (
-                    <Scorecards run={raw} rank={rank} />
+                    <Scorecards
+                      run={raw}
+                      summary={snap.personal_score}
+                      reviewed={snap.event.results_finalized}
+                    />
                   ) : snap.event.status !== "running" ? (
                     <div className="panel empty">
                       <Pause size={32} />
@@ -954,7 +983,7 @@ export default function CyberType() {
                         <div className="typing-footer">
                           <span>
                             <Wifi size={13} />
-                            {pending.current.length || batch.current
+                            {inputBuffer.pending.length || inputBuffer.batch
                               ? "Saving keystrokes…"
                               : "Progress saved"}
                           </span>
@@ -1016,8 +1045,8 @@ export default function CyberType() {
                             </div>
                           ))}
                         <p className="muted small">
-                          Combined score: {total.toLocaleString()} pts · Overall
-                          rank: #{rank || "—"}
+                          Combined calculated score: {total.toLocaleString()}{" "}
+                          pts · Personal statistics only
                         </p>
                       </div>
                     )}
@@ -1028,79 +1057,86 @@ export default function CyberType() {
           {tab === "leaderboard" && (
             <>
               <PageTitle
-                eyebrow="THE FAST LANE"
-                title="Every keystroke earns its place."
+                eyebrow="OFFICIAL RESULTS"
+                title={
+                  publicVisible
+                    ? "The final standings."
+                    : "Every result deserves a fair review."
+                }
                 subtitle={
-                  projector
-                    ? "CyberType / Tantra 26 · Live overall standings"
-                    : "Live standings across all three rounds. Public aliases only."
+                  publicVisible
+                    ? "Approved by the coordinator. Public aliases only."
+                    : "The leaderboard opens only after coordinator approval."
                 }
               />
-              <div className="board-toolbar">
-                <span className="status live">
-                  <span className="dot" /> LIVE STANDINGS
-                </span>
-                <span className="muted">{board.length} competitors</span>
-                {!projector && (
+              {!projector && (
+                <div className="board-toolbar">
+                  <span className="status">
+                    {publicVisible ? "FINAL RESULTS" : "LEADERBOARD LOCKED"}
+                  </span>
                   <button onClick={showBoard}>
                     <Maximize2 size={16} /> Audience display
                   </button>
-                )}
-              </div>
-              <div className="panel table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>RANK</th>
-                      <th>PARTICIPANT</th>
-                      <th>ROUND</th>
-                      <th>WPM</th>
-                      <th>ACCURACY</th>
-                      <th>TOTAL SCORE</th>
-                      <th>STATUS</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {board.map((p, i) => (
-                      <tr key={p.id} className={p.id === raw?.id ? "you" : ""}>
-                        <td>
-                          <span className={"place p" + i}>
-                            {String(i + 1).padStart(2, "0")}
-                          </span>
-                        </td>
-                        <td>
-                          <span className="avatar">
-                            {p.alias.slice(0, 2).toUpperCase()}
-                          </span>
-                          <strong>{p.alias}</strong>
-                          {p.id === raw?.id && (
-                            <small className="you-tag">YOU</small>
-                          )}
-                        </td>
-                        <td>0{p.round}</td>
-                        <td className="mono">{p.wpm}</td>
-                        <td>{p.accuracy}%</td>
-                        <td className="accent mono">
-                          {p.score.toLocaleString()} <small>pts</small>
-                        </td>
-                        <td>
-                          <span className="tag">{p.status}</span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {!board.length && (
-                  <p className="empty">No entries yet. Be the first to join.</p>
-                )}
-              </div>
-              <p className="muted small">
-                Ranked by total score descending; ties use participant ID
-                ascending. WPM and accuracy reflect the latest round.
-                {!configured
-                  ? " Demo competitors are fixed sample results."
-                  : ""}
-              </p>
+                </div>
+              )}
+              {!publicVisible ? (
+                <LockedLeaderboard />
+              ) : (
+                <div className="approved-board">
+                  <div className="panel table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>RANK</th>
+                          <th>PARTICIPANT</th>
+                          <th>ROUND</th>
+                          <th>WPM</th>
+                          <th>ACCURACY</th>
+                          <th>FINAL SCORE</th>
+                          <th>STATUS</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {board.map((p) => (
+                          <tr key={p.id}>
+                            <td>
+                              <span className={"place p" + (p.rank - 1)}>
+                                {String(p.rank).padStart(2, "0")}
+                              </span>
+                            </td>
+                            <td>
+                              <span className="avatar">
+                                {p.alias.slice(0, 2).toUpperCase()}
+                              </span>
+                              <strong>{p.alias}</strong>
+                            </td>
+                            <td>0{p.round}</td>
+                            <td className="mono">{p.wpm}</td>
+                            <td>{p.accuracy}%</td>
+                            <td className="accent mono">
+                              {p.final_score.toLocaleString()}{" "}
+                              <small>pts</small>
+                            </td>
+                            <td>
+                              <span className="tag">{p.status}</span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {!board.length && (
+                      <p className="empty">
+                        No results were recorded for this event.
+                      </p>
+                    )}
+                  </div>
+                  <p className="muted small">
+                    Final scores include approved adjustments. Equal scores use
+                    participant ID order. WPM and accuracy reflect the latest
+                    round.
+                  </p>
+                </div>
+              )}
             </>
           )}
           {tab === "rules" && (
@@ -1164,7 +1200,7 @@ export default function CyberType() {
               </div>
             </>
           )}
-          {tab === "admin" && (snap.admin || demoAdmin) && (
+          {tab === "admin" && snap.admin && (
             <>
               <PageTitle
                 eyebrow="MISSION CONTROL"
@@ -1218,7 +1254,7 @@ export default function CyberType() {
                   [
                     "ONLINE",
                     snap.participants?.filter(
-                      (p) => Date.now() - Date.parse(p.last_seen) < 10000,
+                      (p) => observedAt - Date.parse(p.last_seen) < 10000,
                     ).length || 0,
                   ],
                   [
@@ -1253,6 +1289,17 @@ export default function CyberType() {
                   <Download size={16} /> Export CSV
                 </button>
               </div>
+              <ResultsReview
+                snap={snap}
+                working={working}
+                onCommand={command}
+                search={search}
+                onReview={(id) => {
+                  const r = snap.participants?.find((p) => p.id === id);
+                  if (r) setSelected(r);
+                }}
+              />
+              <h3>Live participant monitoring</h3>
               <div className="panel table-wrap">
                 <table>
                   <thead>
@@ -1272,8 +1319,10 @@ export default function CyberType() {
                     </tr>
                   </thead>
                   <tbody>
-                    {snap.participants
-                      ?.filter((p) =>
+                    {privateStandings
+                      .map((b) => snap.participants?.find((p) => p.id === b.id))
+                      .filter((p): p is Run => !!p)
+                      .filter((p) =>
                         (p.alias + p.id)
                           .toLowerCase()
                           .includes(search.toLowerCase()),
@@ -1290,12 +1339,12 @@ export default function CyberType() {
                               <span
                                 className={
                                   "tag " +
-                                  (Date.now() - Date.parse(p.last_seen) < 10000
+                                  (observedAt - Date.parse(p.last_seen) < 10000
                                     ? "accent"
                                     : "")
                                 }
                               >
-                                {Date.now() - Date.parse(p.last_seen) < 10000
+                                {observedAt - Date.parse(p.last_seen) < 10000
                                   ? "Online"
                                   : "Offline"}
                               </span>
@@ -1337,10 +1386,16 @@ export default function CyberType() {
                               </small>
                             </td>
                             <td>
-                              {entry(p).score}
+                              {
+                                privateStandings.find((b) => b.id === p.id)
+                                  ?.final_score
+                              }
                               <small className="id">
                                 Rank #
-                                {board.findIndex((x) => x.id === p.id) + 1}
+                                {
+                                  privateStandings.find((b) => b.id === p.id)
+                                    ?.rank
+                                }
                               </small>
                             </td>
                             <td>
@@ -1375,10 +1430,14 @@ export default function CyberType() {
                 <h3>Event activity</h3>
                 {snap.audit?.length ? (
                   snap.audit.map((a, i) => (
-                    <div key={i}>
-                      <span>{a.action}</span>
-                      <time>{new Date(a.created_at).toLocaleString()}</time>
-                    </div>
+                    <details key={a.id || i}>
+                      <summary>
+                        <span>{a.action}</span>
+                        <time>{new Date(a.created_at).toLocaleString()}</time>
+                      </summary>
+                      <p className="small">Admin: {a.actor || "Coordinator"}</p>
+                      <pre>{JSON.stringify(a.details || {}, null, 2)}</pre>
+                    </details>
                   ))
                 ) : (
                   <p className="muted">Admin actions will appear here.</p>
@@ -1484,31 +1543,46 @@ export default function CyberType() {
           </section>
         </div>
       )}
-      {selected && (
-        <div className="modal-backdrop">
-          <section
-            className="modal wide"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Participant scorecards"
-          >
-            <button
-              className="close"
-              aria-label="Close scorecards"
-              onClick={() => setSelected(null)}
+      {selected &&
+        snap.admin &&
+        privateStandings.some((p) => p.id === selected.id) && (
+          <div className="modal-backdrop">
+            <section
+              className="modal wide"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Participant scorecards"
             >
-              ×
-            </button>
-            <Scorecards
-              run={
-                snap.participants?.find((p) => p.id === selected.id) || selected
-              }
-              rank={board.findIndex((p) => p.id === selected.id) + 1}
-            />
-          </section>
-        </div>
-      )}
-      {edit && (
+              <button
+                className="close"
+                aria-label="Close scorecards"
+                onClick={() => setSelected(null)}
+              >
+                ×
+              </button>
+              {notice && (
+                <p className="notice" role="alert">
+                  {notice}
+                </p>
+              )}
+              <ReviewDetails
+                key={selected.id}
+                standing={privateStandings.find((p) => p.id === selected.id)!}
+                run={
+                  snap.participants?.find((p) => p.id === selected.id) ||
+                  selected
+                }
+                adjustments={(snap.adjustments || []).filter(
+                  (a) => a.user_id === selected.id,
+                )}
+                snap={snap}
+                working={working}
+                onCommand={command}
+              />
+            </section>
+          </div>
+        )}
+      {edit && snap.admin && (
         <div className="modal-backdrop">
           <section
             className="modal wide"
@@ -1695,58 +1769,5 @@ function PageTitle({
       <h1>{title}</h1>
       <p>{subtitle}</p>
     </div>
-  );
-}
-function Scorecards({ run, rank }: { run: Run; rank: number }) {
-  return (
-    <section className="scorecards">
-      <span className="eyebrow">YOUR PERFORMANCE / {run.alias}</span>
-      <h2>
-        {run.status === "complete"
-          ? "Run complete. Well played."
-          : "Competition scorecards"}
-      </h2>
-      <div className="score-total panel">
-        <Trophy size={36} />
-        <div>
-          <small>COMBINED SCORE</small>
-          <strong>
-            {entry(run).score.toLocaleString()} <span>pts</span>
-          </strong>
-        </div>
-        <div>
-          <small>OVERALL RANK</small>
-          <strong>#{rank || "—"}</strong>
-        </div>
-      </div>
-      <div className="round-grid">
-        {roundNames.map((name, i) => {
-          const c = run.cards[i];
-          return (
-            <div className="panel" key={name}>
-              <span className="eyebrow">ROUND 0{i + 1}</span>
-              <h3>{name}</h3>
-              <span className="tag">{c?.status || "Not played"}</span>
-              <dl>
-                {[
-                  ["Score", c?.score || 0],
-                  ["WPM", c?.wpm || 0],
-                  ["Accuracy", (c?.accuracy ?? 100) + "%"],
-                  ["Errors", c?.errors || 0],
-                  ["Time", (c?.elapsed.toFixed(1) || 0) + "s"],
-                  ["Best combo", c?.best || 0],
-                  ["Penalties", "−" + (c?.penalty || 0)],
-                ].map(([k, v]) => (
-                  <div key={k}>
-                    <dt>{k}</dt>
-                    <dd>{v}</dd>
-                  </div>
-                ))}
-              </dl>
-            </div>
-          );
-        })}
-      </div>
-    </section>
   );
 }

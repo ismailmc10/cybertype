@@ -1,5 +1,7 @@
 # CyberType / Tantra 26
 
+**Existing production upgrade:** Apply only `supabase/002_results_review.sql`, then redeploy Vercel. Do not rerun 001. Follow [Results Review deployment and event-day workflow](RESULTS_REVIEW_DEPLOYMENT.md). Rankings are now private until an ended event is finalized and explicitly revealed.
+
 A complete Next.js App Router + TypeScript competition app with an offline-credential-free demo and a Supabase production backend. The initial workspace was empty; no pre-existing application was replaced.
 
 ## Run locally
@@ -16,7 +18,7 @@ Open http://localhost:3000. With both environment variables absent, the app runs
 
 ## Production Supabase setup
 
-1. Create a Supabase project. In **SQL Editor**, run `supabase/001_cybertype.sql` once. It creates the event, runs, public board, admin allowlist, append-only-for-clients audit table, RLS policies, server scoring functions, and Realtime publication membership. The migration is transactional when submitted as one query; do not rerun against an existing initialized database.
+1. Create a Supabase project. For a brand-new empty database, in **SQL Editor** run `supabase/001_cybertype.sql` followed by `supabase/002_results_review.sql`. Existing production databases must run only 002. It creates the event, runs, public board, admin allowlist, append-only-for-clients audit table, RLS policies, server scoring functions, and Realtime publication membership. The migration is transactional when submitted as one query; do not rerun against an existing initialized database.
 2. Under **Authentication → Providers**, enable email/password authentication. Keep email confirmation enabled; configure a production SMTP sender and appropriate authentication rate limits for your event's registrations.
 3. In **Authentication → URL Configuration**, set Site URL to `http://localhost:3000` during local setup, then to your final HTTPS Vercel URL. Add the corresponding allowed redirect URL for each environment. Confirmation links return participants to the app; they then sign in with email/password.
 4. Copy `.env.example` to `.env.local` and set:
@@ -38,8 +40,8 @@ Open http://localhost:3000. With both environment variables absent, the app runs
    There is no public admin registration or self-promotion API. To revoke admin access, delete that allowlist row in the SQL Editor. Do not put admin identity in editable user metadata.
 
 6. Sign in as the coordinator. **Event control** appears after the next snapshot. Configure event details, prompts, durations, multipliers and penalties before starting. Production starts in **waiting**, with registration open.
-7. Register a participant in a separate browser/session. Join with a **public alias** (not an email address). Open the leaderboard's **Audience display** for the projector; it does not require a login and contains no admin controls or emails.
-8. Close registration when ready, then start the event. Joining remains possible while running only if the coordinator leaves registration open. Pausing freezes the shared competition clock for every participant. End freezes attempts and closes registration. Export CSV before a reset; reset deletes attempts and standings but retains the audit log.
+7. Register a participant in a separate browser/session. Join with a **public alias** (not an email address). Open the leaderboard's **Audience display** for the projector; it does not require a login and stays locked until final results are explicitly revealed. It contains no admin controls or emails.
+8. Close registration when ready, then start the event. Joining remains possible while running only if the coordinator leaves registration open. Pausing freezes the shared competition clock for every participant. End freezes attempts and closes registration while keeping rankings private. Review results, apply reasoned adjustments, finalize, then explicitly reveal. Export CSV before a reset; reset deletes attempts, standings and adjustments but retains the audit log.
 
 The migration enables Realtime for `cyber_board` and `cyber_event`. Clients subscribe to those tables and also refresh on an approximately one-second interval, so dropped Realtime connections recover automatically.
 
@@ -77,13 +79,13 @@ The rules page always displays the saved event configuration. Settings lock afte
 - Each correct character adds `points × current multiplier` to **earned**. The character reaching a milestone uses the new multiplier. Round 1 always uses 1×.
 - `round score = max(0, round((earned + speedWeight × WPM) × accuracy / 100 − penalties))`.
 - Live WPM and score can decrease as time passes. Completed cards are frozen. A third Hash Lock mistake retains earned points after the first two penalties; it does not zero the previous rounds.
-- Overall score is the sum of the three cards. Rank sorts score descending, then participant UUID ascending for deterministic ties. There is no unspecified qualifying cutoff. A blocked participant remains visible and marked; coordinator disputes use the published rule that judges' decisions are final.
+- Base score is the sum of the three cards. Final score adds the approved signed manual adjustments. Private/final rank sorts final score descending, then participant UUID ascending for deterministic ties. Personal scorecards never display rank; public standings require explicit reveal. There is no unspecified qualifying cutoff. A blocked participant remains visible and marked; coordinator disputes use the published rule that judges' decisions are final.
 - Default prompts are included in the migration and `lib/game.ts`. Prompts accept 10–2000 printable ASCII characters; Hash Lock requires hexadecimal. Durations accept 5–600 seconds. Milestone multipliers must start at 1 and increase; the second penalty must exceed the first. The four-second transition and three-strike rule are fixed competition mechanics.
 
 ## Security, persistence, and operational assumptions
 
 - `/api/event` verifies a signed-in Supabase user for mutation requests and calls the database RPC with that user's token. The database independently checks identity and the admin allowlist; calling the RPC directly cannot bypass those checks.
-- RLS and table grants allow participants to read only their own run. Only admins can read every run or the audit log. Anonymous users can read only event settings and the public leaderboard projection. Email/password data remains in Supabase Auth. Public aliases and random participant IDs appear in standings/CSV.
+- RLS and table grants allow participants to read only their own run. Only admins can read every run or the audit log. Anonymous users can read event settings and only the officially revealed leaderboard. Locked board rows cannot be read directly or through RPC. Email/password data remains in Supabase Auth. Public aliases and random participant IDs appear in standings/CSV.
 - Clients cannot directly insert/update scores, roles, event settings, audit rows or run state. Private helper functions have public execution revoked. All privileged functions use an empty search path and qualified object names.
 - Scoring, errors, penalties, server time, transitions, and leaderboard updates happen transactionally inside PostgreSQL. The event row lock serializes event changes and input processing so pause/end cannot interleave with a scoring write. This is deliberately optimized for a single supervised lab event, not a large multi-tenant tournament. Load-test with your expected participant count before event day; the current snapshot/RPC processes active runs and returns the overall standings.
 - Keystrokes are batched (maximum 50/request) with a per-round sequence number. Retried acknowledged batches do not count twice. The browser keeps unacknowledged production input in sessionStorage scoped to the signed-in user. Input is visually predicted but server responses remain authoritative. A network outage locks new input, retries saved input, and leaves the timer running. Received-after-deadline keystrokes cannot change a closed round.
@@ -97,6 +99,7 @@ The rules page always displays the saved event configuration. Settings lock afte
 ```sh
 npm test
 npm run typecheck
+npm run lint
 npm run build
 npm start
 ```
@@ -115,3 +118,5 @@ Manual browser verification covers demo registration/countdown, individual keyst
 - `tests/competition.test.ts`: engine and database integration/security tests.
 
 Reference documentation: [Supabase RLS](https://supabase.com/docs/guides/database/postgres/row-level-security) and [Next.js environment variables](https://nextjs.org/docs/app/guides/environment-variables).
+
+The new review state, migration order, full list of changed files, and remaining hosted-integration checks are documented in [RESULTS_REVIEW_DEPLOYMENT.md](RESULTS_REVIEW_DEPLOYMENT.md).

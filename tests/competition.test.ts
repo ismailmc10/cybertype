@@ -2,7 +2,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
-import { advance, defaults, Run, Event, blank } from "../lib/game";
+import { advance, defaults, Run, Event, blank, Snapshot } from "../lib/game";
 const db = new PGlite();
 const user = "00000000-0000-0000-0000-000000000001";
 const admin = "00000000-0000-0000-0000-000000000002";
@@ -13,7 +13,7 @@ async function identity(id: string | null) {
   ]);
 }
 async function api(action: string, payload: unknown = {}) {
-  const res = await db.query<{ r: any }>(
+  const res = await db.query<{ r: Snapshot }>(
     "select public.cyber_api($1,$2::jsonb) r",
     [action, JSON.stringify(payload)],
   );
@@ -24,6 +24,7 @@ before(async () => {
     `create role anon; create role authenticated; create schema auth; create table auth.users(id uuid primary key); create function auth.uid() returns uuid language sql as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$; grant usage on schema auth to anon,authenticated; grant execute on function auth.uid() to anon,authenticated; create publication supabase_realtime;`,
   );
   await db.exec(readFileSync("supabase/001_cybertype.sql", "utf8"));
+  await db.exec(readFileSync("supabase/002_results_review.sql", "utf8"));
   await db.query("insert into auth.users values($1),($2),($3)", [
     user,
     admin,
@@ -172,16 +173,17 @@ test("database roles reject impersonation, public writes, helper calls, and admi
   await api("join", { alias: "Tester" });
   await identity(other);
   await api("join", { alias: "Other" });
-  const own = await db.query("select * from public.cyber_runs");
+  const own = await db.query<{ id: string }>("select * from public.cyber_runs");
   assert.equal(own.rows.length, 1);
-  assert.equal((own.rows[0] as any).id, other);
+  assert.equal(own.rows[0].id, other);
   await identity(null);
   await db.exec("reset role;set role anon");
   const s = await api("snapshot");
   assert.equal(s.admin, false);
   assert.equal(s.run, null);
   assert.equal(s.participants, null);
-  assert.equal(s.leaderboard.length, 2);
+  assert.equal(s.leaderboard.length, 0);
+  assert.equal(s.standings.length, 0);
   await assert.rejects(api("join", { alias: "Anonymous" }), /Authentication/);
   await assert.rejects(
     db.exec("select * from public.cyber_runs"),
@@ -214,7 +216,7 @@ test("admin configuration validates defaults, confirms destructive actions, and 
   );
   const paused = await api("admin", { command: "pause" });
   assert.equal(paused.event.status, "paused");
-  assert.ok(paused.audit.some((x: any) => x.action === "start"));
+  assert.ok(paused.audit!.some((x) => x.action === "start"));
   const end = await api("admin", { command: "end", confirm: "CONFIRM" });
   assert.equal(end.event.status, "ended");
   assert.equal(end.event.registration, false);
@@ -254,42 +256,42 @@ test("server integration: exact command symbols, batch replay, per-user run, liv
     seq: 1,
     chars: cfg.prompts[0].split(""),
   });
-  assert.equal(s.run.round, 2);
-  assert.equal(s.run.cards[0].pos, 10);
-  assert.equal(s.run.cards[0].status, "completed");
+  assert.equal(s.run!.round, 2);
+  assert.equal(s.run!.cards[0].pos, 10);
+  assert.equal(s.run!.cards[0].status, "completed");
   await db.exec(
     "update public.cyber_event set clock=10,active_since=clock_timestamp() where id=1",
   );
   s = await api("tick", { round: 2, seq: 1, chars: cfg.prompts[1].split("") });
-  assert.equal(s.run.round, 3);
-  assert.equal(s.run.cards[1].errors, 0);
-  const saved = s.run.cards[1].score;
+  assert.equal(s.run!.round, 3);
+  assert.equal(s.run!.cards[1].errors, 0);
+  const saved = s.run!.cards[1].score;
   s = await api("tick", { round: 2, seq: 1, chars: cfg.prompts[1].split("") });
-  assert.equal(s.run.cards[1].score, saved);
+  assert.equal(s.run!.cards[1].score, saved);
   await db.exec(
     "update public.cyber_event set clock=15,active_since=clock_timestamp() where id=1",
   );
   s = await api("tick", { round: 3, seq: 1, chars: ["z"] });
-  assert.equal(s.run.cards[2].penalty, 100);
-  assert.equal(s.run.status, "active");
+  assert.equal(s.run!.cards[2].penalty, 100);
+  assert.equal(s.run!.status, "active");
   await identity(admin);
   const paused = await api("admin", { command: "pause" });
   await identity(user);
   s = await api("tick", { round: 3, seq: 2, chars: ["z"] });
-  assert.equal(s.run.cards[2].errors, 1);
+  assert.equal(s.run!.cards[2].errors, 1);
   assert.equal(s.event.clock, paused.event.clock);
   await identity(admin);
   await api("admin", { command: "start" });
   await identity(user);
   s = await api("tick", { round: 3, seq: 2, chars: ["z"] });
-  assert.equal(s.run.cards[2].errors, 2);
-  assert.equal(s.run.status, "active");
+  assert.equal(s.run!.cards[2].errors, 2);
+  assert.equal(s.run!.status, "active");
   s = await api("tick", { round: 3, seq: 3, chars: ["z"] });
-  assert.equal(s.run.cards[2].status, "eliminated");
-  assert.equal(s.run.cards.length, 3);
-  assert.equal(s.run.status, "complete");
+  assert.equal(s.run!.cards[2].status, "eliminated");
+  assert.equal(s.run!.cards.length, 3);
+  assert.equal(s.run!.status, "complete");
   assert.equal(
-    s.leaderboard[0].score,
-    s.run.cards.reduce((n: number, c: any) => n + c.score, 0),
+    s.personal_score!.base_score,
+    s.run!.cards.reduce((n, c) => n + c.score, 0),
   );
 });

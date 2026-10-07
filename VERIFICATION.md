@@ -1,30 +1,45 @@
-# Verification — October 6, 2026
+# Verification — results review upgrade, October 7, 2026
 
-## Automated checks
+- `npm run typecheck`: passed.
+- `npm run lint`: passed, zero warnings.
+- `npm test`: 16 tests passed, zero failures.
+- `npm run build`: passed; Next.js static frontend and dynamic API route generated successfully.
+- Dependency audit after adding lint tooling: zero vulnerabilities reported.
+- `git diff --check`: passed.
 
-- `npm test`: **6 passed, 0 failed**. Tests execute the migration, RLS/grants, and actual PL/pgSQL scoring logic under PGlite PostgreSQL.
-- `npm run typecheck`: **passed**.
-- `npm run build`: **passed**, including static page generation and the dynamic API route.
-- npm dependency audit during installation: **0 vulnerabilities reported**.
+## Database and component tests
 
-The database tests cover score parity between TypeScript and SQL, combo milestone/reset behavior, both penalties before elimination, exactly three rounds, timer/countdown transitions, pause/resume, exact command symbols, repeated input batches, invalid settings, admin confirmation, audit logging, unauthenticated mutations, participant row isolation, forbidden direct table writes and private helper access.
+The tests execute the existing and new migration in PGlite PostgreSQL, rather than mocking the score/RLS implementation:
 
-## Browser verification
+1. Existing SQL/demo scoring parity, combo reset, and input replay protection.
+2. Round 3 first/second penalties and third-strike elimination; no sudden death in Round 1.
+3. Exactly three automatic rounds, timers, countdowns and pause.
+4. Participant/anonymous identity isolation and forbidden direct writes/private helper calls.
+5. Configuration validation, destructive-action confirmation and event audit.
+6. Complete server-side three-round competition including special command characters.
+7. Migration preserves existing runs/base scores; a second application is safe.
+8. Locked board rows and canonical standings are inaccessible to anon/participant table/function/RPC queries.
+9. Participants cannot promote themselves, modify scores/audit, create adjustments, or reveal/finalize results.
+10. End stays hidden; adjustments require an ended event, a valid nonzero signed integer, category, mandatory reason, and confirmation.
+11. Deductions/grace/custom deltas update final totals and ordering, preserve originals, audit authenticated admin identity, and deduplicate retries.
+12. Finalization/reveal require fresh review versions and confirmation; finalized results reject changes; tie order is consistent.
+13. Hide/reopen remove read access; reopening allows corrections; negative totals and CSV escaping work.
+14. Reset removes adjustments/attempts/standings, retains audit, resets visibility/finalization, and preserves the two original Realtime publications.
+15. Personal scorecards render no rank, position, percentile or ahead-count before or after approval.
+16. Locked display contains no table; Results Review renders nothing for a participant snapshot.
 
-Tested the running local app in the Codex browser:
+## Local browser checks
 
-- Joined as `test_runner`; four-second countdown automatically entered Speed Run.
-- Typed individual characters and observed WPM, accuracy, progress and score update.
-- Refreshed and returned to the arena; typed progress survived.
-- Admin dashboard showed the participant, connection status and live metrics.
-- Paused the event; the remaining time stayed at 35 seconds. Resumed successfully.
-- Tried pasting; the app blocked it and displayed a message, without changing progress.
-- Speed Run timed out and saved its scorecard; Terminal Rush began automatically.
-- Reproduced the terminal prompt including quotes, wildcard, slash, hyphen, pipe, ampersands and underscore. Finished at 100% accuracy with a 59-character best combo and 2× multiplier.
-- Hash Lock began automatically. First wrong character applied 100 points of penalty without elimination. Second applied a further 250. Third eliminated the participant from the round.
-- Combined scorecard preserved all three cards and overall rank. Screenshot: `screenshots/scorecards.png`.
-- Tested 390×844 mobile viewport: navigation and event/admin layouts adapted; no page-wide horizontal overflow. Restored the normal viewport afterward.
+- Locked overview and audience screen contain no participant rankings or leaderboard scores.
+- Completed personal scorecard shows personal/base/adjustment totals and round metrics without rank.
+- Private Results Review is visible in demo admin, with separate base/adjustment/final columns.
+- End confirms and does not reveal results.
+- Applied −100 for a sample incident, then +25 for a sample organizer delay; confirmed each signed change with alias and reason. Base remained 3820; adjustment history recorded both; final became 3745.
+- Finalize requires confirmation and keeps the audience locked.
+- Revealing updates a separate audience tab automatically to the adjusted final scores. Audience markup contains no coordinator controls, reasons, or emails.
+- Hiding requires confirmation and restores the locked audience screen.
+- Demonstration uses existing local sample data only; no production scores were changed.
 
-## External checks still required
+## Remaining external checks
 
-No Supabase/Vercel project credentials were supplied. Hosted email confirmation, production login, actual Supabase websocket delivery, and Vercel deployment have not been exercised. Follow README setup and perform the two-session staging rehearsal before using the app for the live event. The local database tests validate policies and functions but do not substitute for hosted integration or concurrent-load testing.
+No hosted credentials were supplied. Supabase Auth/email, hosted Realtime websocket delivery, production-schema drift from the checked-in 001 migration, real concurrent load, and the actual Vercel redeploy are not verified here. Apply 002 first, redeploy, then run the short two-session check in `RESULTS_REVIEW_DEPLOYMENT.md`.

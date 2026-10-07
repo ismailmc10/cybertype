@@ -78,13 +78,55 @@ export type Entry = {
   wpm: number;
   accuracy: number;
 };
+export type ReviewEvent = Event & {
+  leaderboard_visible: boolean;
+  results_finalized: boolean;
+  results_version: number;
+};
+export type ScoreSummary = {
+  base_score: number;
+  manual_adjustment: number;
+  final_score: number;
+};
+export type Standing = Entry & ScoreSummary & { rank: number };
+export const adjustmentCategories = [
+  "malpractice",
+  "rule_violation",
+  "grace",
+  "sportsmanship",
+  "technical_compensation",
+  "manual_correction",
+  "other",
+] as const;
+export type AdjustmentCategory = (typeof adjustmentCategories)[number];
+export type Adjustment = {
+  id: number;
+  event_id: number;
+  user_id: string;
+  delta: number;
+  reason: string;
+  category: AdjustmentCategory;
+  created_by: string;
+  created_at: string;
+  request_id: string;
+};
+export type Audit = {
+  id?: number;
+  actor?: string;
+  action: string;
+  details?: Record<string, unknown>;
+  created_at: string;
+};
 export type Snapshot = {
-  event: Event;
+  event: ReviewEvent;
   run: Run | null;
-  leaderboard: Entry[];
+  leaderboard: Standing[];
+  standings: Standing[];
+  personal_score: ScoreSummary | null;
+  adjustments?: Adjustment[] | null;
   admin: boolean;
-  participants?: Run[];
-  audit?: { action: string; created_at: string }[];
+  participants?: Run[] | null;
+  audit?: Audit[] | null;
 };
 export function blank(round: number, now: number): Card {
   return {
@@ -190,7 +232,6 @@ export function advance(
       r.ready = e.clock + 4;
     }
   }
-  r.last_seen = new Date().toISOString();
   return r;
 }
 export function entry(r: Run): Entry {
